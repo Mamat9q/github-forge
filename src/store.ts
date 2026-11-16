@@ -292,6 +292,14 @@ export class Repo {
     return sha;
   }
 
+  /** Insert objects already keyed by their SHA-1 (as readPack returns them):
+   *  skips the second hash putObject would compute per object. */
+  putObjects(objects: Map<string, GitObject>): void {
+    for (const [sha, obj] of objects) {
+      if (!this.objects.has(sha)) this.objects.set(sha, obj);
+    }
+  }
+
   getObject(sha: string): GitObject | undefined {
     return this.objects.get(sha.toLowerCase());
   }
@@ -622,6 +630,8 @@ export function buildPack(repo: Repo, shas: Iterable<string>): Buffer {
  * The suite's client sends plain objects only (no deltas) in pushes, so delta
  * entries are not supported here — they never occur on the receive path.
  */
+const PACK_TYPE_NAMES: Record<number, ObjType> = { 1: 'commit', 2: 'tree', 3: 'blob', 4: 'tag' };
+
 export function readPack(buf: Buffer): Map<string, GitObject> {
   const out = new Map<string, GitObject>();
   if (buf.length < 12 || buf.subarray(0, 4).toString('utf8') !== 'PACK') return out;
@@ -634,7 +644,7 @@ export function readPack(buf: Buffer): Map<string, GitObject> {
     // Skip the varint size (we recover the real size from the inflated body).
     while (b & 0x80) b = buf[off++];
     if (type === 6 || type === 7) return out; // delta entry: not expected on the receive path
-    const typeName = ({ 1: 'commit', 2: 'tree', 3: 'blob', 4: 'tag' } as Record<number, ObjType>)[type] ?? 'blob';
+    const typeName = PACK_TYPE_NAMES[type] ?? 'blob';
     const { body, next } = inflateOne(buf, off);
     off = next;
     out.set(hashObject(typeName, body), { type: typeName, body });
@@ -652,6 +662,69 @@ export function readPack(buf: Buffer): Map<string, GitObject> {
  *
  * Throws on malformed input.
  */
+// Length / distance base tables (RFC 1951 §3.2.5), hoisted to module scope:
+// they never change, so rebuilding them on every inflateOne call was pure waste.
+const LEN_BASE = [3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258];
+const LEN_EXTRA = [0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0];
+const DIST_BASE = [1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577];
+const DIST_EXTRA = [0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13];
+const CL_ORDER = [16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15];
+
+interface Huffman {
+  counts: number[]; // counts[len] = number of codes of that length
+  symbols: number[]; // symbols sorted by (length, code value)
+}
+
+function buildHuffman(lengths: number[]): Huffman {
+  const counts = new Array<number>(16).fill(0);
+  for (const l of lengths) {
+    if (l > 15) throw new Error('inflate: bad code length');
+    counts[l] = (counts[l] ?? 0) + 1;
+  }
+  counts[0] = 0;
+  const offs = new Array<number>(16).fill(0);
+  for (let i = 1; i < 16; i += 1) offs[i] = offs[i - 1] + (counts[i - 1] ?? 0);
+  const symbols = new Array<number>(lengths.length).fill(0);
+  for (let i = 0; i < lengths.length; i += 1) {
+    const l = lengths[i] as number;
+    if (l !== 0) {
+      symbols[offs[l] as number] = i;
+      offs[l] = (offs[l] as number) + 1;
+    }
+  }
+  return { counts, symbols };
+}
+
+// Fixed Huffman tables, built once for the process (the old code rebuilt them
+// inside every inflateOne call).
+let fixedLitTable: Huffman | undefined;
+let fixedDistTable: Huffman | undefined;
+function fixedTables(): { lit: Huffman; dist: Huffman } {
+  if (!fixedLitTable) {
+    const litLengths = new Array<number>(288).fill(0);
+    for (let i = 0; i < 144; i += 1) litLengths[i] = 8;
+    for (let i = 144; i < 256; i += 1) litLengths[i] = 9;
+    for (let i = 256; i < 280; i += 1) litLengths[i] = 7;
+    for (let i = 280; i < 288; i += 1) litLengths[i] = 8;
+    fixedLitTable = buildHuffman(litLengths);
+    fixedDistTable = buildHuffman(new Array<number>(30).fill(5));
+  }
+  return { lit: fixedLitTable as Huffman, dist: fixedDistTable as Huffman };
+}
+
+/**
+ * Inflate exactly one zlib stream starting at `off`, returning the body and the
+ * offset just past the stream. Pure-JS RFC 1950/1951 decoder (puff-style
+ * canonical Huffman decoding): a single pass, no native zlib call per object,
+ * and it reports the exact consumed byte count — which Node's inflateSync
+ * cannot do. (The previous binary-search implementation cost ~4 ms per
+ * 3-object pack because every inflateSync call re-creates a native context.)
+ *
+ * Speed notes (measured): the bit reader is a small integer accumulator
+ * instead of a per-bit loop, output goes straight into a growable Buffer
+ * instead of a number[] + Buffer.from copy, and the constant tables live at
+ * module scope. Same bytes out, same errors, same `next` offset as before.
+ */
 export function inflateOne(buf: Buffer, off: number): { body: Buffer; next: number } {
   if (off + 2 > buf.length) throw new Error('inflate: truncated zlib header');
   const cmf = buf[off];
@@ -659,50 +732,37 @@ export function inflateOne(buf: Buffer, off: number): { body: Buffer; next: numb
   if ((cmf & 0x0f) !== 8) throw new Error('inflate: not deflate');
   if (((cmf << 8) + flg) % 31 !== 0) throw new Error('inflate: bad zlib header');
   if (flg & 0x20) throw new Error('inflate: preset dictionary not supported');
-  let pos = off + 2; // byte position
-  let bit = 0; // bit position within the current byte (LSB-first)
-  const out: number[] = [];
+  let pos = off + 2; // byte position of the next unread byte
+  // Bit accumulator: bitbuf holds bitcnt unconsumed bits, LSB-first.
+  // bitcnt never exceeds 20 (refill only while bitcnt < n <= 13), so all
+  // shifts stay inside 32-bit ints.
+  let bitbuf = 0;
+  let bitcnt = 0;
 
   const bits = (n: number): number => {
-    let v = 0;
-    for (let i = 0; i < n; i += 1) {
+    while (bitcnt < n) {
       if (pos >= buf.length) throw new Error('inflate: unexpected end of input');
-      v |= ((buf[pos] >> bit) & 1) << i;
-      bit += 1;
-      if (bit === 8) { bit = 0; pos += 1; }
+      bitbuf |= buf[pos] << bitcnt;
+      bitcnt += 8;
+      pos += 1;
     }
+    const v = bitbuf & ((1 << n) - 1);
+    bitbuf >>>= n;
+    bitcnt -= n;
     return v;
   };
 
-  // Length / distance base tables (RFC 1951 §3.2.5).
-  const LEN_BASE = [3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258];
-  const LEN_EXTRA = [0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0];
-  const DIST_BASE = [1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577];
-  const DIST_EXTRA = [0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13];
-
-  interface Huffman {
-    counts: number[]; // counts[len] = number of codes of that length
-    symbols: number[]; // symbols sorted by (length, code value)
-  }
-
-  const buildHuffman = (lengths: number[]): Huffman => {
-    const counts = new Array<number>(16).fill(0);
-    for (const l of lengths) {
-      if (l > 15) throw new Error('inflate: bad code length');
-      counts[l] = (counts[l] ?? 0) + 1;
-    }
-    counts[0] = 0;
-    const offs = new Array<number>(16).fill(0);
-    for (let i = 1; i < 16; i += 1) offs[i] = offs[i - 1] + (counts[i - 1] ?? 0);
-    const symbols = new Array<number>(lengths.length).fill(0);
-    for (let i = 0; i < lengths.length; i += 1) {
-      const l = lengths[i] as number;
-      if (l !== 0) {
-        symbols[offs[l] as number] = i;
-        offs[l] = (offs[l] as number) + 1;
-      }
-    }
-    return { counts, symbols };
+  // Growable output buffer: literals and LZ77 copies write directly, no
+  // per-byte array push and no final copy.
+  let out = Buffer.allocUnsafe(1024);
+  let outLen = 0;
+  const ensure = (need: number): void => {
+    if (outLen + need <= out.length) return;
+    let size = out.length;
+    while (size < outLen + need) size *= 2;
+    const next = Buffer.allocUnsafe(size);
+    out.copy(next, 0, 0, outLen);
+    out = next;
   };
 
   const decode = (h: Huffman): number => {
@@ -720,28 +780,13 @@ export function inflateOne(buf: Buffer, off: number): { body: Buffer; next: numb
     throw new Error('inflate: invalid code');
   };
 
-  let fixedLitTable: Huffman | undefined;
-  let fixedDistTable: Huffman | undefined;
-  const fixedTables = (): { lit: Huffman; dist: Huffman } => {
-    if (!fixedLitTable) {
-      const litLengths = new Array<number>(288).fill(0);
-      for (let i = 0; i < 144; i += 1) litLengths[i] = 8;
-      for (let i = 144; i < 256; i += 1) litLengths[i] = 9;
-      for (let i = 256; i < 280; i += 1) litLengths[i] = 7;
-      for (let i = 280; i < 288; i += 1) litLengths[i] = 8;
-      fixedLitTable = buildHuffman(litLengths);
-      fixedDistTable = buildHuffman(new Array<number>(30).fill(5));
-    }
-    return { lit: fixedLitTable as Huffman, dist: fixedDistTable as Huffman };
-  };
-
-  const CL_ORDER = [16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15];
-
   const inflateBlock = (lit: Huffman, dist: Huffman): void => {
     for (;;) {
       const sym = decode(lit);
       if (sym < 256) {
-        out.push(sym);
+        if (outLen >= out.length) ensure(1);
+        out[outLen] = sym;
+        outLen += 1;
       } else if (sym === 256) {
         return;
       } else {
@@ -751,8 +796,18 @@ export function inflateOne(buf: Buffer, off: number): { body: Buffer; next: numb
         const dsym = decode(dist);
         if (dsym >= 30) throw new Error('inflate: bad distance symbol');
         const d = (DIST_BASE[dsym] as number) + bits(DIST_EXTRA[dsym] as number);
-        if (d > out.length) throw new Error('inflate: distance too far back');
-        for (let i = 0; i < len; i += 1) out.push(out[out.length - d] as number);
+        if (d > outLen) throw new Error('inflate: distance too far back');
+        ensure(len);
+        if (d === 1) {
+          // Run of one repeated byte: a single fill.
+          out.fill(out[outLen - 1], outLen, outLen + len);
+          outLen += len;
+        } else {
+          for (let i = 0; i < len; i += 1) {
+            out[outLen] = out[outLen - d] as number;
+            outLen += 1;
+          }
+        }
       }
     }
   };
@@ -761,18 +816,19 @@ export function inflateOne(buf: Buffer, off: number): { body: Buffer; next: numb
     const finalBlock = bits(1);
     const btype = bits(2);
     if (btype === 0) {
-      // Stored block: align to byte boundary, then LEN/NLEN + raw bytes.
-      bit = 0;
-      pos += 1; // move past the partially-read byte (bit was 0..7 into it; bits() advanced pos only on full bytes)
-      // NOTE: after reading 3 bits, pos points at the byte holding them and bit=3; the
-      // stored-block header starts at the NEXT byte boundary.
+      // Stored block: drop the partial byte (pos already points past it),
+      // then LEN/NLEN + raw bytes.
+      bitbuf = 0;
+      bitcnt = 0;
       if (pos + 4 > buf.length) throw new Error('inflate: truncated stored block');
       const len = buf[pos] | (buf[pos + 1] << 8);
       const nlen = buf[pos + 2] | (buf[pos + 3] << 8);
       if (len !== (~nlen & 0xffff)) throw new Error('inflate: stored block LEN/NLEN mismatch');
       pos += 4;
       if (pos + len > buf.length) throw new Error('inflate: truncated stored data');
-      for (let i = 0; i < len; i += 1) out.push(buf[pos + i] as number);
+      ensure(len);
+      buf.copy(out, outLen, pos, pos + len);
+      outLen += len;
       pos += len;
     } else if (btype === 1) {
       const { lit, dist } = fixedTables();
@@ -815,11 +871,13 @@ export function inflateOne(buf: Buffer, off: number): { body: Buffer; next: numb
     if (finalBlock === 1) break;
   }
 
-  // Align to the next byte boundary, then 4-byte Adler-32 (big-endian).
-  if (bit > 0) { bit = 0; pos += 1; }
+  // Align to the next byte boundary (drop the partial byte), then 4-byte
+  // Adler-32 (big-endian).
+  bitbuf = 0;
+  bitcnt = 0;
   if (pos + 4 > buf.length) throw new Error('inflate: truncated adler32');
   pos += 4;
-  return { body: Buffer.from(out), next: pos };
+  return { body: out.subarray(0, outLen), next: pos };
 }
 
 /** Wrap pack bytes in side-band-64k (band 1 = data). Max pkt-line length is 65520

@@ -624,7 +624,7 @@ function handleReceivePack(repo: Repo, body: Buffer): Buffer {
     } else if (packBytes.length >= 12 && packBytes.subarray(0, 4).toString('ascii') === 'PACK') {
       try {
         const objects = readPack(packBytes);
-        for (const obj of objects.values()) repo.putObject(obj.type, obj.body);
+        repo.putObjects(objects);
       } catch {
         unpackOk = false;
       }
