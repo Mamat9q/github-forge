@@ -40,12 +40,41 @@ function sendJson(res: ServerResponse, status: number, body: unknown, headers: R
 }
 
 function sendResp(res: ServerResponse, r: Resp): void {
-  const body = typeof r.body === 'string' ? r.body : r.body;
-  const present = new Set(Object.keys(r.headers ?? {}).map((k) => k.toLowerCase()));
-  const headers: Record<string, string> = { ...(r.headers ?? {}) };
-  if (!present.has('x-github-request-id')) headers['x-github-request-id'] = nextRequestId();
-  if (!present.has('content-type')) headers['content-type'] = JSON_TYPE;
-  if (!present.has('content-length')) headers['content-length'] = String(Buffer.byteLength(body as Buffer | string));
+  const body = r.body;
+  const h = r.headers;
+  // Fast path: the REST json()/jsonRaw() responses always carry Content-Type
+  // + X-GitHub-Request-Id + a precomputed Content-Length — write them
+  // straight out with no scanning, no Set, no object copy.
+  if (
+    h !== undefined &&
+    (h['Content-Type'] !== undefined || h['content-type'] !== undefined) &&
+    (h['X-GitHub-Request-Id'] !== undefined || h['x-github-request-id'] !== undefined) &&
+    (h['Content-Length'] !== undefined || h['content-length'] !== undefined)
+  ) {
+    res.writeHead(r.status, h);
+    res.end(body);
+    return;
+  }
+  // Slow path (git plain()/git responses, GraphQL/MCP, 404/500): fill in
+  // whichever of the three standard headers is missing, case-insensitively.
+  const headers: Record<string, string> = {};
+  if (h !== undefined) {
+    for (const k of Object.keys(h)) headers[k] = h[k];
+  }
+  let hasCT = false;
+  let hasLen = false;
+  let hasReqId = false;
+  for (const k of Object.keys(headers)) {
+    const lk = k.toLowerCase();
+    if (lk === 'content-type') hasCT = true;
+    else if (lk === 'content-length') hasLen = true;
+    else if (lk === 'x-github-request-id') hasReqId = true;
+  }
+  if (!hasCT) headers['content-type'] = JSON_TYPE;
+  if (!hasReqId) headers['x-github-request-id'] = nextRequestId();
+  if (!hasLen) {
+    headers['content-length'] = String(typeof body === 'string' ? Buffer.byteLength(body) : body.length);
+  }
   res.writeHead(r.status, headers);
   res.end(body);
 }
@@ -69,19 +98,16 @@ function readBody(req: IncomingMessage): Promise<Buffer> {
   });
 }
 
-function headerMap(req: IncomingMessage): Record<string, string | undefined> {
-  const out: Record<string, string | undefined> = {};
-  for (const [k, v] of Object.entries(req.headers)) {
-    out[k.toLowerCase()] = Array.isArray(v) ? v.join(', ') : v;
-  }
-  return out;
-}
-
 export function createApp(): Server {
   const server = createServer(async (req: IncomingMessage, res: ServerResponse) => {
     try {
-      const url = new URL(req.url ?? '/', 'http://entry');
-      const path = url.pathname;
+      // Manual URL split: `new URL()` costs ~1-2us per request and the
+      // handlers only need the raw path + query string. Percent-escapes
+      // stay encoded here; the REST handler decodes each segment and the
+      // git handler decodes owner/repo itself, exactly as before.
+      const rawUrl = req.url ?? '/';
+      const qPos = rawUrl.indexOf('?');
+      const path = qPos < 0 ? rawUrl : rawUrl.slice(0, qPos);
       const method = req.method ?? 'GET';
 
       // Boot probe: no auth, no body.
@@ -90,9 +116,12 @@ export function createApp(): Server {
         return;
       }
 
-      const headers = headerMap(req);
+      // Node lowercases every incoming header name, so req.headers is used
+      // directly — the old headerMap() rebuild per request is gone. Values
+      // may be string[] for duplicated headers; the readers join them.
+      const headers = req.headers as unknown as Record<string, string | undefined>;
       const body = method === 'GET' || method === 'HEAD' ? Buffer.alloc(0) : await readBody(req);
-      const query = url.searchParams;
+      const query = new URLSearchParams(qPos < 0 ? '' : rawUrl.slice(qPos + 1));
 
       let r: Resp | null = null;
       if (path === '/api/graphql') {

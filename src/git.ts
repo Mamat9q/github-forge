@@ -45,11 +45,9 @@ export async function handleGit(
   }
   const rest = m[3];
 
-  const lowerHeaders: Record<string, string> = {};
-  for (const [k, v] of Object.entries(headers)) {
-    if (v !== undefined) lowerHeaders[k.toLowerCase()] = v;
-  }
-  const isV2 = (lowerHeaders['git-protocol'] ?? '').trim() === 'version=2';
+  // Node lowercases every incoming header name; read it directly.
+  const gp = headers['git-protocol'];
+  const isV2 = (typeof gp === 'string' ? gp : Array.isArray(gp) ? (gp as unknown as string[]).join(', ') : '').trim() === 'version=2';
 
   if (method === 'GET' && rest === 'info/refs') {
     const service = query.get('service') ?? '';
@@ -62,7 +60,7 @@ export async function handleGit(
       return {
         status: 200,
         headers: { 'content-type': 'application/x-git-receive-pack-advertisement' },
-        body: v0Advertisement(repo, 'git-receive-pack'),
+        body: cachedRecvAdv(repo),
       };
     }
     // git-upload-pack, or no service (ungraded): v2 when Git-Protocol: version=2, else v0.
@@ -302,12 +300,13 @@ function v0Advertisement(repo: Repo, service: 'git-upload-pack' | 'git-receive-p
   const chunks: Buffer[] = [pktLine(`# service=${service}\n`), FLUSH_PKT];
   const lines: string[] = [];
   const headOid = repo.refs.get(headTarget(repo)) ?? '';
+  const refs = sortedRefs(repo);
   if (repo.refs.size === 0) {
     lines.push(`${ZERO_OID} capabilities^{}`);
   } else {
     if (headOid !== '') lines.push(`${headOid} HEAD`);
-    for (const ref of sortedRefs(repo)) lines.push(`${ref.oid} ${ref.name}`);
-    for (const ref of sortedRefs(repo)) {
+    for (const ref of refs) lines.push(`${ref.oid} ${ref.name}`);
+    for (const ref of refs) {
       if (ref.peeled) lines.push(`${ref.peeled} ${ref.name}^{}`);
     }
   }
@@ -335,6 +334,18 @@ function cachedAdv(repo: Repo, service: 'git-upload-pack', v2: boolean): Buffer 
   const hit = advCache.get(key);
   if (hit) return hit;
   const out = v2 ? v2Advertisement() : v0Advertisement(repo, service);
+  cacheSet(advCache, key, out);
+  return out;
+}
+
+/** The receive-pack advertisement was rebuilt on every push (sortedRefs
+ *  twice + pkt-line assembly); the push workload issues one per push, so
+ *  it is cached on the same fingerprint as the upload-pack one. */
+function cachedRecvAdv(repo: Repo): Buffer {
+  const key = `${fingerprint(repo)}|adv|git-receive-pack`;
+  const hit = advCache.get(key);
+  if (hit) return hit;
+  const out = v0Advertisement(repo, 'git-receive-pack');
   cacheSet(advCache, key, out);
   return out;
 }

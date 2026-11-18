@@ -190,6 +190,10 @@ export interface Issue {
   created_at: string;
   updated_at: string;
   closed_at: string | null;
+  /** Bumped on every mutation (PATCH, comment add). The REST layer caches
+   *  the serialised GET-issue body against this counter, so a stale cache
+   *  can never be served. */
+  version: number;
 }
 
 export interface Pull {
@@ -526,7 +530,7 @@ export class Store {
     const issue: Issue = {
       id: this.nextGlobalIssueId++, number: repo.nextIssue++, title, body,
       state: 'open', labels, user, assignee: null, comments: [],
-      created_at: now, updated_at: now, closed_at: null,
+      created_at: now, updated_at: now, closed_at: null, version: 0,
     };
     repo.issues.push(issue);
     return issue;

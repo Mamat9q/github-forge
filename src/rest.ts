@@ -36,10 +36,31 @@ export interface Resp {
 const JSON_CT = 'application/json; charset=utf-8';
 
 function json(status: number, body: unknown, ctx: Ctx, extra?: Record<string, string>): Resp {
+  const text = JSON.stringify(body);
   return {
     status,
-    headers: { 'Content-Type': JSON_CT, 'X-GitHub-Request-Id': ctx.reqId(), ...(extra ?? {}) },
-    body: JSON.stringify(body),
+    headers: {
+      'Content-Type': JSON_CT,
+      'X-GitHub-Request-Id': ctx.reqId(),
+      // Precomputed here so sendResp never re-measures the body.
+      'Content-Length': String(Buffer.byteLength(text)),
+      ...(extra ?? {}),
+    },
+    body: text,
+  };
+}
+
+/** Like json() but for a body that is already serialised (the GET-issue
+ *  cache hands over a prebuilt string + length). */
+function jsonRaw(status: number, body: string, byteLen: number, ctx: Ctx): Resp {
+  return {
+    status,
+    headers: {
+      'Content-Type': JSON_CT,
+      'X-GitHub-Request-Id': ctx.reqId(),
+      'Content-Length': String(byteLen),
+    },
+    body,
   };
 }
 
@@ -47,19 +68,22 @@ function err(status: number, message: string, ctx: Ctx): Resp {
   return json(status, { message }, ctx);
 }
 
+/** Node lowercases every incoming header name, so a direct lookup is exact;
+ *  duplicate headers arrive as an array and are joined like before. */
 function headerVal(headers: Record<string, string | undefined>, name: string): string | undefined {
-  const want = name.toLowerCase();
-  for (const k of Object.keys(headers)) {
-    if (k.toLowerCase() === want) return headers[k];
-  }
-  return undefined;
+  const v = headers[name.toLowerCase()];
+  if (v === undefined) return undefined;
+  return Array.isArray(v) ? (v as unknown as string[]).join(', ') : v;
 }
 
 function bearerToken(headers: Record<string, string | undefined>): string | null {
   const v = headerVal(headers, 'authorization');
   if (!v) return null;
-  const m = v.match(/^Bearer\s+(.+)$/i);
-  return m ? m[1].trim() : null;
+  // Equivalent to /^Bearer\s+(.+)$/i with the token trimmed, without a regex.
+  if (v.length > 7 && v.slice(0, 6).toLowerCase() === 'bearer' && (v[6] === ' ' || v[6] === '\t')) {
+    return v.slice(7).trim();
+  }
+  return null;
 }
 
 /** Auth: a Bearer token is always required. When ctx.token is set it must
@@ -114,7 +138,22 @@ function lineDiff(oldText: string, newText: string): { add: number; del: number 
 
 // ------------------------------------------------------------------ shapes
 
+// The authenticated user's shape is identical on every response that embeds
+// it (issues, comments, pulls, repos, commits) — build it once and reuse
+// the same object. Callers only ever JSON.stringify it, never mutate it.
+const VIEWER_SHAPE: Record<string, unknown> = {
+  login: VIEWER.login,
+  id: VIEWER.id,
+  avatar_url: `https://avatars.githubusercontent.com/u/${VIEWER.id}?v=4`,
+  gravatar_id: '',
+  url: `https://api.github.com/users/${VIEWER.login}`,
+  html_url: `https://github.com/${VIEWER.login}`,
+  type: 'User',
+  site_admin: false,
+};
+
 function userShape(u: User): Record<string, unknown> {
+  if (u === VIEWER) return VIEWER_SHAPE;
   return {
     login: u.login,
     id: u.id,
@@ -729,6 +768,35 @@ async function handleContents(
 
 // ------------------------------------------------------------------ issues
 
+// Prebuilt GET-issue response bodies, per repo + issue number, valid while
+// the issue's version counter is unchanged. The read workload GETs the same
+// issue 2,000 times with no mutation in between; rebuilding the shape and
+// re-stringifying per request is pure waste. The cache stores the exact
+// bytes json() would have produced, plus their byte length, so a hit skips
+// issueShape, JSON.stringify and Buffer.byteLength entirely. Invalidation
+// is by version, bumped at the only two mutation sites (PATCH, comment
+// add) — a stale body can never be served.
+const issueBodyCache = new WeakMap<Repo, Map<number, { version: number; body: string; length: number }>>();
+
+function cachedIssue(repo: Repo, issue: Issue): { body: string; length: number } | null {
+  const perRepo = issueBodyCache.get(repo);
+  if (!perRepo) return null;
+  const hit = perRepo.get(issue.number);
+  if (!hit || hit.version !== issue.version) return null;
+  return hit;
+}
+
+function storeIssueCache(repo: Repo, issue: Issue, body: string): number {
+  const length = Buffer.byteLength(body);
+  let perRepo = issueBodyCache.get(repo);
+  if (!perRepo) {
+    perRepo = new Map();
+    issueBodyCache.set(repo, perRepo);
+  }
+  perRepo.set(issue.number, { version: issue.version, body, length });
+  return length;
+}
+
 async function handleIssues(
   method: string,
   tail: string[],
@@ -779,7 +847,13 @@ async function handleIssues(
   if (!issue) return err(404, 'Not Found', ctx);
 
   if (tail.length === 1) {
-    if (method === 'GET') return json(200, issueShape(repo, issue), ctx);
+    if (method === 'GET') {
+      const hit = cachedIssue(repo, issue);
+      if (hit) return jsonRaw(200, hit.body, hit.length, ctx);
+      const body = JSON.stringify(issueShape(repo, issue));
+      const length = storeIssueCache(repo, issue, body);
+      return jsonRaw(200, body, length, ctx);
+    }
     if (method === 'PATCH') {
       if (isObj(parsed)) {
         if (parsed.state === 'open' || parsed.state === 'closed') {
@@ -789,6 +863,9 @@ async function handleIssues(
         if (typeof parsed.title === 'string') issue.title = parsed.title;
         if (typeof parsed.body === 'string') issue.body = parsed.body;
         issue.updated_at = fixedIso();
+        // Any PATCH invalidates the cached GET body, even if no field
+        // changed (updated_at is reassigned above).
+        issue.version += 1;
       }
       return json(200, issueShape(repo, issue), ctx);
     }
@@ -809,6 +886,8 @@ async function handleIssues(
         updated_at: fixedIso(),
       };
       issue.comments.push(comment);
+      // comments.length is part of the GET-issue body — invalidate it.
+      issue.version += 1;
       return json(201, commentShape(repo, comment), ctx);
     }
     if (method === 'GET') {
